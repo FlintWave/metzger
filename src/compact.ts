@@ -26,6 +26,10 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
 /** Tokens the request envelope (`model`, key names) adds around state and questions. */
 const REQUEST_OVERHEAD_TOKENS = 20;
 
+/** Ollama's decision endpoint accepts 1 to 64 questions per request; two are asked per call. */
+export const MAX_QUESTIONS_PER_REQUEST = 64;
+const MAX_CALLS_PER_REQUEST = Math.floor(MAX_QUESTIONS_PER_REQUEST / 2);
+
 function finite(value: number | undefined, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
@@ -68,7 +72,8 @@ export function questionsFor(call: ToolCall): JevQuestions {
 
 /**
  * Splits the candidate calls into batches whose questions, together with the
- * (always complete) state, fit one request.
+ * (always complete) state, fit one request, and never more than the endpoint's
+ * question limit allows.
  */
 export function batchCalls(
   calls: readonly ToolCall[],
@@ -81,7 +86,10 @@ export function batchCalls(
   let currentTokens = 0;
   for (const call of calls) {
     const tokens = estimateTokens(JSON.stringify(questionsFor(call)));
-    if (current.length > 0 && currentTokens + tokens > budget) {
+    if (
+      current.length > 0 &&
+      (currentTokens + tokens > budget || current.length >= MAX_CALLS_PER_REQUEST)
+    ) {
       batches.push(current);
       current = [];
       currentTokens = 0;
@@ -251,7 +259,7 @@ function count(decisions: readonly CallDecision[], reason: CallDecision['reason'
  * Compacts a transcript by asking Jev, for every tool call outside the pinned
  * first and newest messages, whether the call and whether its result must
  * stay. The whole history (results omitted, fitted into `maxStateTokens`) is
- * sent as state with every batch of questions. Throws when Jev fails or the
+ * sent as state with every batch of questions, one batch at a time. Throws when Jev fails or the
  * history cannot be fitted; the caller decides whether to fall back.
  */
 export async function compact(
@@ -272,10 +280,12 @@ export async function compact(
     const state = fitState(messages, calls, resolved);
     fitted = state;
     batches = batchCalls(candidates, state.tokens, resolved);
-    const answered = await Promise.all(
-      batches.map((batch) => askBatch(asker, state.state, batch)),
-    );
-    for (const map of answered) for (const [id, answer] of map) answers.set(id, answer);
+    // One request at a time: Ollama serves a model's requests one after another
+    // anyway, and concurrent requests only queue behind each other until the
+    // later ones exceed the caller's per-request timeout.
+    for (const batch of batches) {
+      for (const [id, answer] of await askBatch(asker, state.state, batch)) answers.set(id, answer);
+    }
   }
 
   const decisions = calls.map((call) =>

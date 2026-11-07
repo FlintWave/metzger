@@ -8,46 +8,48 @@ import type {
   TurnCompleteInput,
 } from 'claude-code';
 
+import {
+  createJevAsker,
+  DEFAULT_MODEL,
+  DEFAULT_SYSTEMONE_URL,
+  ollamaBaseUrl,
+  resolveBackend,
+  SYSTEMONE_MAX_REQUEST_TOKENS,
+  SYSTEMONE_MAX_STATE_TOKENS,
+  systemOneUrl,
+  type Backend,
+  type BackendOption,
+  type FetchInit,
+  type FetchLike,
+  type FetchResponse,
+} from '../src/backend.js';
 import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
-import { ChatJevAsker } from '../src/chat-asker.js';
-import { buildJevRequest, parseJevResponse } from '../src/request.js';
 import type {
   CompactOptions,
   CompactResult,
-  JevAsker,
   Message,
   ToolResult,
   ToolUse,
 } from '../src/types.js';
 
 const HOOK_DEFAULTS = {
-  baseUrl: 'http://localhost:11434/v1/systemone',
+  baseUrl: DEFAULT_SYSTEMONE_URL,
   compactAtPercent: 60,
   minReductionRatio: 0.25,
-  model: 'kaineone/metzger:0.8b',
+  model: DEFAULT_MODEL,
 };
 
-export type HookFetchInit = {
-  method?: string;
-  headers?: Record<string, string>;
-  body?: string;
-};
-
-export type HookFetchResponse = {
-  status: number;
-  ok: boolean;
-  text: string;
-};
-
+export type HookFetchInit = FetchInit;
+export type HookFetchResponse = FetchResponse;
 /** The shape of `$.http.fetch`, so the hook can be driven without an engine. */
-export type HookFetch = (url: string, init?: HookFetchInit) => Promise<HookFetchResponse>;
+export type HookFetch = FetchLike;
 
 export type HookConfig = CompactOptions & {
   baseUrl: string;
   compactAtPercent: number;
   minReductionRatio: number;
   model: string;
-  backend: 'systemone' | 'chat' | 'auto';
+  backend: BackendOption;
 };
 
 function optionNumber(options: PluginOptions, key: string, fallback: number): number {
@@ -90,33 +92,6 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   const goal = optionString(options, 'goal');
   if (goal) config.goal = goal;
   return config;
-}
-
-/** The local `/v1/systemone` endpoint rejects bodies (text + schema) over 64 KiB; stay under with margin. */
-export const SYSTEMONE_MAX_BODY_BYTES = 60 * 1024;
-/** Conservative token budgets for the systemone backend so a request fits in SYSTEMONE_MAX_BODY_BYTES. */
-export const SYSTEMONE_MAX_REQUEST_TOKENS = 18_000;
-export const SYSTEMONE_MAX_STATE_TOKENS = 15_000;
-
-/** A `JevAsker` over the engine's `$.http.fetch`. */
-export function jevAsker(fetchFn: HookFetch, apiKey: string, model: string, baseUrl?: string): JevAsker {
-  return {
-    async ask(state, questions) {
-      const request = buildJevRequest({ apiKey, model, baseUrl }, state, questions);
-      const bytes = new TextEncoder().encode(request.body).length;
-      if (bytes > SYSTEMONE_MAX_BODY_BYTES) {
-        throw new Error(
-          `request too large for local endpoint (${bytes} bytes > ${SYSTEMONE_MAX_BODY_BYTES} limit)`,
-        );
-      }
-      const response = await fetchFn(request.url, {
-        method: request.method,
-        headers: request.headers,
-        body: request.body,
-      });
-      return parseJevResponse(response.status, response.ok, response.text, request.url);
-    },
-  };
 }
 
 function toolUseSummary(tool: ToolUse): ToolUseSummary {
@@ -178,38 +153,17 @@ export type SessionCompaction = {
   messages: SessionMessage[];
 };
 
-function isChatModel(model: string): boolean {
-  return model.includes('distill');
+function backendOf(config: HookConfig): Backend {
+  return resolveBackend(config.model, config.backend);
 }
 
-function resolveBackend(config: HookConfig): 'systemone' | 'chat' {
-  if (config.backend !== 'auto') return config.backend;
-  return isChatModel(config.model) ? 'chat' : 'systemone';
-}
-
-function chatBaseUrl(baseUrl: string): string {
-  return baseUrl.replace(/\/v1\/systemone\/?$/, '');
-}
-
-/** Runs the library over a session transcript; throws when the key is missing or Jev fails. */
+/** Runs the library over a session transcript; throws when Jev fails or the history cannot be fitted. */
 export async function compactSession(
   messages: readonly SessionMessage[],
   config: HookConfig,
   fetchFn: HookFetch,
 ): Promise<SessionCompaction> {
-  const backend = resolveBackend(config);
-
-  let asker: JevAsker;
-  if (backend === 'chat') {
-    asker = new ChatJevAsker({
-      baseUrl: chatBaseUrl(config.baseUrl ?? 'http://localhost:11434'),
-      model: config.model,
-      fetch: fetchFn,
-    });
-  } else {
-    asker = jevAsker(fetchFn, 'local', config.model, config.baseUrl);
-  }
-
+  const asker = createJevAsker(config, fetchFn);
   const result = await compact(messages, asker, config);
   return { result, messages: toSessionMessages(messages, result.messages) };
 }
@@ -223,7 +177,7 @@ export function summarize(result: CompactResult): string {
   const parts = [
     stats.kept > 0 ? `${stats.kept} kept` : '',
     stats.resultsDropped > 0 ? `${stats.resultsDropped} results truncated` : '',
-    stats.callsDropped > 0 ? `${stats.callsDropped} call_dropped` : '',
+    stats.callsDropped > 0 ? `${stats.callsDropped} calls dropped` : '',
     stats.pinned > 0 ? `${stats.pinned} pinned` : '',
   ].filter(Boolean);
   return `${percent(reductionRatio(result))} reduction; ${
@@ -280,7 +234,7 @@ function notify(
 }
 
 /** Keep in sync with .claude-plugin/plugin.json. */
-export const METZGER_VERSION = '0.6.0';
+export const METZGER_VERSION = '0.6.1';
 
 const NETWORK_TIMEOUT_MS = 10_000;
 const COMPACT_REQUEST_TIMEOUT_MS = 120_000;
@@ -307,6 +261,82 @@ export function withTimeout<T>(schedule: Scheduler, ms: number, label: string, p
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+type HostNet = {
+  clock: { after: Scheduler };
+  http: { fetch: FetchLike };
+};
+
+type SetupState = {
+  /** True once the Ollama check has settled the model name (or was skipped); until then a compaction runs it first. */
+  resolved: boolean;
+  /** False once the check found Ollama down or the model missing: Metzger will fall back, so core may prepare. */
+  usable: boolean;
+  /** The pulled model's context size, 0 when unknown. */
+  numCtx: number;
+  /** The check in flight, so a compaction arriving meanwhile joins it instead of running a second one. */
+  pending?: Promise<void>;
+};
+
+type HostSetup = HostNet & {
+  ui: { toast: (text: string, options?: { timeoutMs?: number }) => void };
+};
+
+/**
+ * Finds the pulled model (and its context size) once, settling `config.model`
+ * on its legacy alias when only that is pulled, and toasts what is missing.
+ * Never throws. A top-level function, as the engine requires of anything `$`
+ * is passed to.
+ */
+function resolveSetup($: HostSetup, config: HookConfig, state: SetupState): Promise<void> {
+  if (state.resolved) return Promise.resolve();
+  if (!state.pending) {
+    state.pending = checkSetup($, config, state).finally(() => {
+      state.pending = undefined;
+    });
+  }
+  return state.pending;
+}
+
+async function checkSetup($: HostSetup, config: HookConfig, state: SetupState): Promise<void> {
+  const check = await checkOllamaModel(hookFetch($, NETWORK_TIMEOUT_MS), config.baseUrl, config.model);
+  state.resolved = true;
+  state.numCtx = check.numCtx;
+  state.usable = check.ollamaUp && check.modelPulled;
+
+  if (!check.ollamaUp) {
+    $.ui.toast(
+      `metzger: Ollama is not running. Install it from https://ollama.com then run: ollama pull ${config.model}`,
+      { timeoutMs: 30_000 },
+    );
+    return;
+  }
+
+  if (!check.modelPulled) {
+    $.ui.toast(
+      `metzger: decision model "${config.model}" not found. Run: ollama pull ${config.model}`,
+      { timeoutMs: 30_000 },
+    );
+    return;
+  }
+
+  if (check.renamed) {
+    $.ui.toast(`metzger: using ${check.model}; update the model option`, { timeoutMs: 15_000 });
+    config.model = check.model;
+  }
+}
+
+/** `$.http.fetch` as a `HookFetch`: each request bounded by `ms` on the host clock, each failure naming its URL once. */
+function hookFetch($: HostNet, ms: number): HookFetch {
+  return (url, init) =>
+    withTimeout((wait, fn) => $.clock.after(wait, fn), ms, `request to ${url}`, $.http.fetch(url, init)).then(
+      (r) => ({ status: r.status, ok: r.ok, text: r.text }),
+      (error: unknown) => {
+        const message = errorMessage(error);
+        throw new Error(message.startsWith('request to ') ? message : `request to ${url} failed: ${message}`);
+      },
+    );
 }
 
 /** The pulled-model name that stands in for `model`, or undefined. Exact name or `:latest` only. */
@@ -380,7 +410,7 @@ async function checkOllamaModel(
     const showResp = await fetchFn(`${ollamaBase}/api/show`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name: resolved }),
+      body: JSON.stringify({ model: resolved, name: resolved }),
     });
     const capabilities = parseCapabilities(showResp);
     return {
@@ -396,14 +426,10 @@ async function checkOllamaModel(
   }
 }
 
-function ollamaBaseUrl(baseUrl: string): string {
-  return baseUrl.replace(/\/v1\/systemone\/?$/, '');
-}
-
 /** The token budgets the next compaction runs with: the backend clamp, then the model's context. */
 export function effectiveConfig(configured: HookConfig, modelNumCtx: number): HookConfig {
   const config = { ...configured };
-  if (resolveBackend(config) === 'systemone') {
+  if (backendOf(config) === 'systemone') {
     config.maxRequestTokens = Math.min(config.maxRequestTokens ?? 30_000, SYSTEMONE_MAX_REQUEST_TOKENS);
     config.maxStateTokens = Math.min(config.maxStateTokens ?? 25_000, SYSTEMONE_MAX_STATE_TOKENS);
   }
@@ -420,12 +446,12 @@ export async function probeLine(
   fetchFn: HookFetch,
   config: HookConfig,
 ): Promise<string> {
-  const backend = resolveBackend(config);
+  const backend = backendOf(config);
   const started = Date.now();
   const elapsed = (): string => `${Date.now() - started} ms`;
   try {
     if (backend === 'chat') {
-      const url = `${chatBaseUrl(config.baseUrl)}/api/chat`;
+      const url = `${ollamaBaseUrl(config.baseUrl)}/api/chat`;
       const response = await fetchFn(url, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -450,7 +476,7 @@ export async function probeLine(
       }
       return `chat probe: HTTP ${response.status} in ${elapsed()}, model answered "${content.trim().slice(0, 40)}"`;
     }
-    const response = await fetchFn(config.baseUrl, {
+    const response = await fetchFn(systemOneUrl(config.baseUrl), {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: 'Bearer local' },
       body: JSON.stringify({
@@ -485,12 +511,27 @@ const COMPACT_RETRIES = 3;
 /** The plugin's file command `commands/status.md`, namespaced by the host as `/metzger:status`. */
 const STATUS_COMMAND = 'metzger:status';
 
+/**
+ * `$.session.compact` rejects while a turn runs; the exact wording is the
+ * host's. Only a message that says a turn is running (or the session is not
+ * idle) earns a retry; any other failure is logged once, since each retry
+ * would re-run the whole scoring pass.
+ */
+function isTurnRunningError(message: string): boolean {
+  return /\bturn\b[^.]*\b(running|runs|in progress|in flight|active|still)\b|\bwhile a turn\b|\bnot idle\b/i.test(message);
+}
+
 export const register: Register = (on: On, options: PluginOptions) => {
   const configured = resolveHookConfig(options);
   let compacting = false;
-  let scheduled = false;
+  /** Counts turn.complete schedules; a timer runs only while it is still the newest, so a lost one blocks nothing. */
+  let generation = 0;
   let setupChecked = false;
-  let modelNumCtx = 0;
+  const setup: SetupState = {
+    resolved: !/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/.test(configured.baseUrl),
+    usable: true,
+    numCtx: 0,
+  };
   let lastCompaction: { at: number; text: string } | undefined;
   const record = (text: string): void => {
     lastCompaction = { at: Date.now(), text };
@@ -502,54 +543,18 @@ export const register: Register = (on: On, options: PluginOptions) => {
     if (setupChecked) return result;
     setupChecked = true;
 
-    const isLocal = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/.test(configured.baseUrl);
-    if (!isLocal) return result;
-
-    const check = await checkOllamaModel(
-      (url, init) =>
-        withTimeout((ms, fn) => $.clock.after(ms, fn), NETWORK_TIMEOUT_MS, `request to ${url}`, $.http.fetch(url, init)).then((r) => ({
-          status: r.status,
-          ok: r.ok,
-          text: r.text,
-        })),
-      configured.baseUrl,
-      configured.model,
-    );
-    modelNumCtx = check.numCtx;
-
-    if (!check.ollamaUp) {
-      $.ui.toast(
-        'metzger: Ollama is not running. Install it from https://ollama.com then run: ollama pull kaineone/metzger:0.8b',
-        { timeoutMs: 30_000 },
-      );
-      return result;
-    }
-
-    if (!check.modelPulled) {
-      $.ui.toast(
-        `metzger: decision model "${configured.model}" not found. Run: ollama pull ${configured.model}`,
-        { timeoutMs: 30_000 },
-      );
-      return result;
-    }
-
-    if (check.renamed) {
-      $.ui.toast(`metzger: using ${check.model}; update the model option`, { timeoutMs: 15_000 });
-      configured.model = check.model;
-    }
+    // The engine awaits session.start before the first prompt, so the network
+    // check runs from a timer and never holds the session up.
+    $.clock.after(0, () => {
+      void resolveSetup($, configured, setup);
+    });
 
     return result;
   });
 
-  on('command.run', async ($, event, next) => {
-    if (event.command !== STATUS_COMMAND) return next(event);
-    const fetchFn = (url: string, init?: HookFetchInit, ms = NETWORK_TIMEOUT_MS): Promise<HookFetchResponse> =>
-      withTimeout((ms, fn) => $.clock.after(ms, fn), ms, `request to ${url}`, $.http.fetch(url, init)).then((r) => ({
-        status: r.status,
-        ok: r.ok,
-        text: r.text,
-      }));
-    const backend = resolveBackend(configured);
+  on('command.run', { command: STATUS_COMMAND }, async ($) => {
+    const fetchFn = hookFetch($, NETWORK_TIMEOUT_MS);
+    const backend = backendOf(configured);
     const lines = [
       `metzger ${METZGER_VERSION}`,
       `backend: ${backend}`,
@@ -576,27 +581,30 @@ export const register: Register = (on: On, options: PluginOptions) => {
       lines.push(`ollama: not reachable: ${errorMessage(error)}`);
     }
 
-    let numCtx = modelNumCtx;
+    let numCtx = setup.numCtx;
     if (reachable) {
       const check = await checkOllamaModel(fetchFn, configured.baseUrl, configured.model);
       if (!check.modelPulled) {
         lines.push(`model: not pulled (run: ollama pull ${configured.model})`);
       } else {
         numCtx = check.numCtx || numCtx;
+        setup.numCtx = numCtx;
         const note = check.renamed ? ` (pulled as ${check.model}; update the model option)` : '';
         lines.push(`model: pulled${note}, num_ctx ${check.numCtx || 'unknown'}`);
-        if (!check.capabilities) {
-          lines.push('capabilities: not reported by Ollama');
-        } else {
-          lines.push(`capabilities: ${check.capabilities.join(', ') || '(none)'}`);
-          if (!check.capabilities.includes('decision')) {
-            lines.push(
-              'WARNING: the model lacks the "decision" capability, which /v1/systemone needs. Pull kaineone/metzger:0.8b.',
-            );
+        if (backend === 'systemone') {
+          if (!check.capabilities) {
+            lines.push('capabilities: not reported by Ollama');
+          } else {
+            lines.push(`capabilities: ${check.capabilities.join(', ') || '(none)'}`);
+            if (!check.capabilities.includes('decision')) {
+              lines.push(
+                `WARNING: the model lacks the "decision" capability, which /v1/systemone needs. Pull ${DEFAULT_MODEL}.`,
+              );
+            }
           }
         }
       }
-      lines.push(await probeLine((url, init) => fetchFn(url, init, PROBE_TIMEOUT_MS), configured));
+      lines.push(await probeLine(hookFetch($, PROBE_TIMEOUT_MS), configured));
     } else {
       lines.push('model and probe: skipped (Ollama not reachable)');
     }
@@ -624,22 +632,29 @@ export const register: Register = (on: On, options: PluginOptions) => {
   on('session.compact', async ($, event, next) => {
     // A subagent's or fork's own transcript: leave it to core.
     if (event.agentId) return next(event);
+    // A precompute installs nothing and runs ahead of time; Metzger decides at
+    // the real compaction, when the transcript is final. Skipping it costs
+    // nothing, where passing it to core would pay for a summary that is thrown
+    // away whenever Metzger's own answer stands. Once the check has found that
+    // Metzger cannot run (Ollama down, model missing) core gets it, so the
+    // fallback summary is ready ahead of time as it was before.
+    if (event.trigger === 'precompute') {
+      return setup.resolved && !setup.usable ? next(event) : { skip: 'metzger decides at compaction time' };
+    }
     try {
-      const config = effectiveConfig(configured, modelNumCtx);
-      const { result, messages } = await compactSession(event.messages, config, async (url, init) => {
-        let response;
-        try {
-          response = await withTimeout(
-            (ms, fn) => $.clock.after(ms, fn),
-            COMPACT_REQUEST_TIMEOUT_MS,
-            `request to ${url}`,
-            $.http.fetch(url, init),
-          );
-        } catch (error) {
-          throw new Error(`request to ${url} failed: ${errorMessage(error)}`);
-        }
-        return { status: response.status, ok: response.ok, text: response.text };
-      });
+      // Through this hook's own `$`, so the wait is not charged to its budget.
+      await resolveSetup($, configured, setup);
+      const config = effectiveConfig(configured, setup.numCtx);
+      // What the person typed after /compact is the most specific statement of
+      // intent there is, so it wins over a configured `goal`.
+      if (event.instructions && event.instructions.trim().length > 0) {
+        config.goal = event.instructions.trim();
+      }
+      const { result, messages } = await compactSession(
+        event.messages,
+        config,
+        hookFetch($, COMPACT_REQUEST_TIMEOUT_MS),
+      );
       for (const line of decisionLogLines(result)) $.ui.log(line);
       if (reductionRatio(result) < config.minReductionRatio) {
         const text = `fallback to built-in summary (below ${percent(config.minReductionRatio)} minimum: ${summarize(result)})`;
@@ -663,30 +678,38 @@ export const register: Register = (on: On, options: PluginOptions) => {
     // Subagent turns reach every hook; only the main loop may trigger compaction.
     if (event.agentId) return next(event);
     const result = await next(event);
-    if (compacting || scheduled) return result;
-    scheduled = true;
+    if (compacting) return result;
+    const mine = ++generation;
 
     // $.session.compact rejects while a turn runs, so start it after this hook
     // returns, and retry a few times if the host has not yet finished the turn.
+    // Every turn schedules; only the newest schedule runs, so a timer the host
+    // refused or lost costs nothing beyond that one turn.
     const run = async (attempt: number): Promise<void> => {
+      if (mine !== generation || compacting) return;
       let retry = false;
+      let owns = false;
       try {
         const { context } = await $.session.usage();
+        if (mine !== generation || compacting) return;
         if ((context.percent ?? 0) < configured.compactAtPercent) return;
         compacting = true;
-        await $.session.compact();
+        owns = true;
+        const outcome = await $.session.compact();
+        if (outcome && 'skip' in outcome && outcome.skip) {
+          record(`auto-compact skipped by a hook (${outcome.skip})`);
+        }
       } catch (error) {
         const message = errorMessage(error);
-        if (/turn is running|in flight/.test(message)) {
+        if (isTurnRunningError(message)) {
           retry = attempt < COMPACT_RETRIES;
-          if (!retry) record(`auto-compact gave up: a turn was still running after ${COMPACT_RETRIES} retries`);
+          if (!retry) record(`auto-compact gave up after ${COMPACT_RETRIES} retries (${message})`);
         } else {
           record(`auto-compact skipped (${message})`);
           $.ui.log(`auto-compact skipped (${message})`);
         }
       } finally {
-        compacting = false;
-        if (!retry) scheduled = false;
+        if (owns) compacting = false;
       }
       if (retry) {
         $.clock.after(COMPACT_RETRY_MS, () => {
