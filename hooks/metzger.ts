@@ -262,6 +262,67 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+type HostNet = {
+  clock: { after: Scheduler };
+  http: { fetch: (url: string, init?: HookFetchInit) => Promise<HookFetchResponse> };
+};
+
+type SetupState = {
+  /** True once the Ollama check has settled the model name (or was skipped); until then a compaction runs it first. */
+  resolved: boolean;
+  /** The pulled model's context size, 0 when unknown. */
+  numCtx: number;
+};
+
+type HostSetup = HostNet & {
+  ui: { toast: (text: string, options?: { timeoutMs?: number }) => void };
+};
+
+/**
+ * Finds the pulled model (and its context size) once, settling `config.model`
+ * on its legacy alias when only that is pulled, and toasts what is missing.
+ * Never throws. A top-level function, as the engine requires of anything `$`
+ * is passed to.
+ */
+async function resolveSetup($: HostSetup, config: HookConfig, state: SetupState): Promise<void> {
+  if (state.resolved) return;
+  const check = await checkOllamaModel(hookFetch($, NETWORK_TIMEOUT_MS), config.baseUrl, config.model);
+  if (state.resolved) return;
+  state.resolved = true;
+  state.numCtx = check.numCtx;
+
+  if (!check.ollamaUp) {
+    $.ui.toast(
+      `metzger: Ollama is not running. Install it from https://ollama.com then run: ollama pull ${config.model}`,
+      { timeoutMs: 30_000 },
+    );
+    return;
+  }
+
+  if (!check.modelPulled) {
+    $.ui.toast(
+      `metzger: decision model "${config.model}" not found. Run: ollama pull ${config.model}`,
+      { timeoutMs: 30_000 },
+    );
+    return;
+  }
+
+  if (check.renamed) {
+    $.ui.toast(`metzger: using ${check.model}; update the model option`, { timeoutMs: 15_000 });
+    config.model = check.model;
+  }
+}
+
+/** `$.http.fetch` as a `HookFetch`, each request bounded by `ms` on the host clock. */
+function hookFetch($: HostNet, ms: number): HookFetch {
+  return (url, init) =>
+    withTimeout((wait, fn) => $.clock.after(wait, fn), ms, `request to ${url}`, $.http.fetch(url, init)).then((r) => ({
+      status: r.status,
+      ok: r.ok,
+      text: r.text,
+    }));
+}
+
 /** The pulled-model name that stands in for `model`, or undefined. Exact name or `:latest` only. */
 function findPulled(names: readonly string[], model: string): string | undefined {
   return names.find((n) => n === model || n === `${model}:latest`);
@@ -446,9 +507,10 @@ export const register: Register = (on: On, options: PluginOptions) => {
   let compacting = false;
   let scheduledAt: number | undefined;
   let setupChecked = false;
-  /** Settles once the Ollama check has run (or was skipped); a compaction waits for it so the model name is final. */
-  let setupDone: Promise<void> = Promise.resolve();
-  let modelNumCtx = 0;
+  const setup: SetupState = {
+    resolved: !/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/.test(configured.baseUrl),
+    numCtx: 0,
+  };
   let lastCompaction: { at: number; text: string } | undefined;
   const record = (text: string): void => {
     lastCompaction = { at: Date.now(), text };
@@ -460,62 +522,17 @@ export const register: Register = (on: On, options: PluginOptions) => {
     if (setupChecked) return result;
     setupChecked = true;
 
-    const isLocal = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/.test(configured.baseUrl);
-    if (!isLocal) return result;
-
     // The engine awaits session.start before the first prompt, so the network
     // check runs from a timer and never holds the session up.
-    const checkSetup = async (): Promise<void> => {
-      const check = await checkOllamaModel(
-        (url, init) =>
-          withTimeout((ms, fn) => $.clock.after(ms, fn), NETWORK_TIMEOUT_MS, `request to ${url}`, $.http.fetch(url, init)).then((r) => ({
-            status: r.status,
-            ok: r.ok,
-            text: r.text,
-          })),
-        configured.baseUrl,
-        configured.model,
-      );
-      modelNumCtx = check.numCtx;
-
-      if (!check.ollamaUp) {
-        $.ui.toast(
-          `metzger: Ollama is not running. Install it from https://ollama.com then run: ollama pull ${configured.model}`,
-          { timeoutMs: 30_000 },
-        );
-        return;
-      }
-
-      if (!check.modelPulled) {
-        $.ui.toast(
-          `metzger: decision model "${configured.model}" not found. Run: ollama pull ${configured.model}`,
-          { timeoutMs: 30_000 },
-        );
-        return;
-      }
-
-      if (check.renamed) {
-        $.ui.toast(`metzger: using ${check.model}; update the model option`, { timeoutMs: 15_000 });
-        configured.model = check.model;
-      }
-    };
-    setupDone = new Promise<void>((resolve) => {
-      $.clock.after(0, () => {
-        checkSetup().then(resolve, resolve);
-      });
+    $.clock.after(0, () => {
+      void resolveSetup($, configured, setup);
     });
 
     return result;
   });
 
-  on('command.run', { command: STATUS_COMMAND }, async ($, event, next) => {
-    if (event.command !== STATUS_COMMAND) return next(event);
-    const fetchFn = (url: string, init?: HookFetchInit, ms = NETWORK_TIMEOUT_MS): Promise<HookFetchResponse> =>
-      withTimeout((ms, fn) => $.clock.after(ms, fn), ms, `request to ${url}`, $.http.fetch(url, init)).then((r) => ({
-        status: r.status,
-        ok: r.ok,
-        text: r.text,
-      }));
+  on('command.run', { command: STATUS_COMMAND }, async ($) => {
+    const fetchFn = hookFetch($, NETWORK_TIMEOUT_MS);
     const backend = backendOf(configured);
     const lines = [
       `metzger ${METZGER_VERSION}`,
@@ -543,14 +560,14 @@ export const register: Register = (on: On, options: PluginOptions) => {
       lines.push(`ollama: not reachable: ${errorMessage(error)}`);
     }
 
-    let numCtx = modelNumCtx;
+    let numCtx = setup.numCtx;
     if (reachable) {
       const check = await checkOllamaModel(fetchFn, configured.baseUrl, configured.model);
       if (!check.modelPulled) {
         lines.push(`model: not pulled (run: ollama pull ${configured.model})`);
       } else {
         numCtx = check.numCtx || numCtx;
-        modelNumCtx = numCtx;
+        setup.numCtx = numCtx;
         const note = check.renamed ? ` (pulled as ${check.model}; update the model option)` : '';
         lines.push(`model: pulled${note}, num_ctx ${check.numCtx || 'unknown'}`);
         if (backend === 'systemone') {
@@ -566,7 +583,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
           }
         }
       }
-      lines.push(await probeLine((url, init) => fetchFn(url, init, PROBE_TIMEOUT_MS), configured));
+      lines.push(await probeLine(hookFetch($, PROBE_TIMEOUT_MS), configured));
     } else {
       lines.push('model and probe: skipped (Ollama not reachable)');
     }
@@ -595,30 +612,26 @@ export const register: Register = (on: On, options: PluginOptions) => {
     // A subagent's or fork's own transcript: leave it to core.
     if (event.agentId) return next(event);
     // A precompute installs nothing and runs ahead of time; Metzger decides at
-    // the real compaction, when the transcript is final. Core may still prepare
-    // the summary the fallback path would use.
-    if (event.trigger === 'precompute') return next(event);
+    // the real compaction, when the transcript is final. Skipping it costs
+    // nothing, where passing it to core would pay for a summary that is thrown
+    // away whenever Metzger's own answer stands.
+    if (event.trigger === 'precompute') return { skip: 'metzger decides at compaction time' };
     try {
-      await setupDone;
-      const config = effectiveConfig(configured, modelNumCtx);
+      // Through this hook's own `$`, so the wait is not charged to its budget.
+      await resolveSetup($, configured, setup);
+      const config = effectiveConfig(configured, setup.numCtx);
       // What the person typed after /compact is the most specific statement of
       // intent there is, so it wins over a configured `goal`.
       if (event.instructions && event.instructions.trim().length > 0) {
         config.goal = event.instructions.trim();
       }
+      const fetchFn = hookFetch($, COMPACT_REQUEST_TIMEOUT_MS);
       const { result, messages } = await compactSession(event.messages, config, async (url, init) => {
-        let response;
         try {
-          response = await withTimeout(
-            (ms, fn) => $.clock.after(ms, fn),
-            COMPACT_REQUEST_TIMEOUT_MS,
-            `request to ${url}`,
-            $.http.fetch(url, init),
-          );
+          return await fetchFn(url, init);
         } catch (error) {
           throw new Error(`request to ${url} failed: ${errorMessage(error)}`);
         }
-        return { status: response.status, ok: response.ok, text: response.text };
       });
       for (const line of decisionLogLines(result)) $.ui.log(line);
       if (reductionRatio(result) < config.minReductionRatio) {
@@ -669,7 +682,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
         const message = errorMessage(error);
         if (isTurnRunningError(message)) {
           retry = attempt < COMPACT_RETRIES;
-          if (!retry) record(`auto-compact gave up: a turn was still running after ${COMPACT_RETRIES} retries`);
+          if (!retry) record(`auto-compact gave up after ${COMPACT_RETRIES} retries (${message})`);
         } else {
           record(`auto-compact skipped (${message})`);
           $.ui.log(`auto-compact skipped (${message})`);

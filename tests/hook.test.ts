@@ -18,6 +18,8 @@ import { ChatJevAsker, parseChoice } from '../src/chat-asker.js';
 import { applyDecisions, collectToolCalls, decideCall, type Message } from '../src/index.js';
 
 type SessionMessage = Message & { handle?: string };
+type FakeResponse = { status: number; ok: boolean; text: string };
+const ok = (text: string): FakeResponse => ({ status: 200, ok: true, text });
 
 function message(role: Message['role'], text: string, extra: Partial<SessionMessage> = {}): SessionMessage {
   return { role, text, toolUses: [], ...extra };
@@ -48,8 +50,11 @@ function transcript(): SessionMessage[] {
   ];
 }
 
+/** A systemone endpoint answering `answer` per question, with Ollama's model listing beside it. */
 function jevFetch(answer: (name: string) => number, bodies: string[] = []) {
-  return async (_url: string, init?: { body?: string }) => {
+  return async (url: string, init?: { body?: string }) => {
+    if (url.endsWith('/api/tags')) return ok(JSON.stringify({ models: [{ name: 'kaineone/metzger:0.8b' }] }));
+    if (url.endsWith('/api/show')) return ok(JSON.stringify({ capabilities: ['decision'], parameters: 'num_ctx 32768' }));
     bodies.push(init?.body ?? '');
     const { questions } = JSON.parse(init?.body ?? '{}') as { questions: Record<string, unknown> };
     const answers = Object.fromEntries(
@@ -242,8 +247,6 @@ describe('ChatJevAsker', () => {
 
 type AnyHook = (...args: any[]) => Promise<any>;
 
-type FakeResponse = { status: number; ok: boolean; text: string };
-
 function setup(
   usagePercent = 90,
   compactImpl: (call: number) => Promise<unknown> = async () => undefined,
@@ -346,17 +349,21 @@ describe('turn.complete auto-compact', () => {
     expect(timers).toHaveLength(0);
   });
 
-  it('gives up silently after 3 retries', async () => {
-    const { hooks, $, flush } = setup(90, async () => {
+  it('gives up silently after 3 retries, keeping the host\'s reason for /metzger:status', async () => {
+    const h = setup(90, async () => {
       throw new Error('a turn is in flight');
     });
+    const { hooks, $, flush } = h;
     await hooks.get('turn.complete')!($, {}, async () => 'r');
     await flush();
     expect($.session.compact).toHaveBeenCalledTimes(4);
     expect($.ui.log).not.toHaveBeenCalled();
+    const status = await runStatus({ ...h, $: { ...h.$, http: { fetch: vi.fn(async () => { throw new Error('offline'); }) } } } as never);
+    expect(status).toContain('auto-compact gave up after 3 retries (a turn is in flight)');
     // and can schedule again on a later turn
+    const timers = $.clock.after.mock.calls.length;
     await hooks.get('turn.complete')!($, {}, async () => 'r');
-    expect($.clock.after).toHaveBeenCalledTimes(5);
+    expect($.clock.after).toHaveBeenCalledTimes(timers + 1);
   });
 
   it('logs other errors without retrying', async () => {
@@ -432,8 +439,6 @@ describe('systemone budgets', () => {
   });
 });
 
-const ok = (text: string): FakeResponse => ({ status: 200, ok: true, text });
-
 /** An Ollama that serves `models`, with `probe` answering the systemone POST. */
 function ollama(models: string[], probe: FakeResponse | (() => FakeResponse)) {
   return async (url: string, init?: { method?: string }): Promise<FakeResponse> => {
@@ -466,14 +471,9 @@ describe('status command', () => {
     expect(h.matchers.get('command.run')).toEqual({ command: 'metzger:status' });
   });
 
-  it('passes other commands (including a bare status) through to next', async () => {
+  it('is dispatched only for metzger:status, by the matcher', () => {
     const h = setup();
-    for (const command of ['status', 'compact', 'metzger:other']) {
-      const next = vi.fn(async () => ({ text: 'core' }));
-      const out = await h.hooks.get('command.run')!(h.$, { command, args: '' }, next);
-      expect(out).toEqual({ text: 'core' });
-      expect(next).toHaveBeenCalledTimes(1);
-    }
+    expect(h.matchers.get('command.run')).toEqual({ command: 'metzger:status' });
   });
 
   it('reports a reachability failure when fetch rejects', async () => {
@@ -530,25 +530,27 @@ describe('model names', () => {
 
 describe('session.compact failures', () => {
   it('surfaces a network error with the url instead of failing silently', async () => {
-    const h = setup(90, undefined, { preserveRecentMessages: 1 }, async () => {
+    const h = setup(90, undefined, { preserveRecentMessages: 1 }, async (url: string) => {
+      if (url.endsWith('/api/tags')) return ok(JSON.stringify({ models: [{ name: 'kaineone/metzger:0.8b' }] }));
+      if (url.endsWith('/api/show')) return ok('{}');
       throw new Error('ECONNRESET');
     });
     const next = vi.fn(async () => 'core');
     const out = await h.hooks.get('session.compact')!(h.$, { messages: transcript() }, next);
     expect(out).toBe('core');
-    const text = h.$.ui.toast.mock.calls[0]![0] as string;
+    const text = h.$.ui.toast.mock.calls.at(-1)![0] as string;
     expect(text).toMatch(/fallback to built-in summary \(request to http:\/\/localhost:11434\/v1\/systemone failed: ECONNRESET\)/);
   });
 });
 
 describe('session.compact triggers', () => {
-  it('leaves a precompute to core without calling the model or toasting', async () => {
+  it('skips a precompute without calling the model, core or toasting', async () => {
     const h = setup(90, undefined, { preserveRecentMessages: 1 }, jevFetch(() => 0.1));
     const next = vi.fn(async () => 'core');
     const event = { trigger: 'precompute', messages: transcript() };
     const out = await h.hooks.get('session.compact')!(h.$, event, next);
-    expect(out).toBe('core');
-    expect(next).toHaveBeenCalledWith(event);
+    expect(out).toEqual({ skip: expect.stringContaining('metzger') });
+    expect(next).not.toHaveBeenCalled();
     expect(h.$.http.fetch).not.toHaveBeenCalled();
     expect(h.$.ui.toast).not.toHaveBeenCalled();
     const status = await runStatus({ ...h, $: { ...h.$, http: { fetch: vi.fn(async () => { throw new Error('offline'); }) } } } as never);
@@ -580,13 +582,18 @@ describe('session.compact triggers', () => {
     };
     const h = setup(90, undefined, { model: 'metzger:0.8b', preserveRecentMessages: 1 }, fetchImpl);
     await h.hooks.get('session.start')!(h.$, {}, async () => 'r');
-    // session.compact arrives before the timer-driven check has run: the hook must wait for it.
-    const pending = h.hooks.get('session.compact')!(h.$, { trigger: 'manual', messages: transcript() }, async () => 'core');
-    await h.flush();
-    const out = await pending;
+    // session.compact arrives before the timer-driven check has run: the hook
+    // runs the check itself, through its own $, without waiting on the timer.
+    const out = await h.hooks.get('session.compact')!(h.$, { trigger: 'manual', messages: transcript() }, async () => 'core');
     expect(out).toHaveProperty('messages');
     expect(bodies).toHaveLength(1);
     expect(JSON.parse(bodies[0]!).model).toBe('kaineone/metzger:0.8b');
+    expect(h.$.ui.toast).toHaveBeenCalledWith('metzger: using kaineone/metzger:0.8b; update the model option', expect.anything());
+    // The timer's own check then finds nothing left to do: no second toast, no second check.
+    const fetches = h.$.http.fetch.mock.calls.length;
+    await h.flush();
+    expect(h.$.http.fetch.mock.calls.length).toBe(fetches);
+    expect(h.$.ui.toast.mock.calls.filter(([t]) => String(t).startsWith('metzger: using'))).toHaveLength(1);
   });
 
   it('records a vetoed auto-compaction', async () => {
@@ -683,11 +690,40 @@ describe('chat answer parsing', () => {
     expect((await chatAsker((t) => `Based on the state, ${t}`).ask('s', q)).answers.q).toEqual({ type: 'noul', noul: 1 });
   });
 
-  it('never reads a letter inside a word', () => {
+  it('never reads a letter inside a word, a lowercase article, or cut-off reasoning', () => {
     expect(parseChoice('Answer:', ['A', 'B'])).toBeUndefined();
     expect(parseChoice('Based on the above', ['A', 'B'])).toBeUndefined();
     expect(parseChoice('Answer: B', ['A', 'B'])).toBe('B');
-    expect(parseChoice('(a)', ['A', 'B'])).toBe('A');
+    expect(parseChoice('This is a keep, so B', ['A', 'B'])).toBe('B');
+    expect(parseChoice('a', ['A', 'B'])).toBe('A');
+    expect(parseChoice('b\n', ['A', 'B'])).toBe('B');
+    expect(parseChoice('<think>A or B? A', ['A', 'B'])).toBeUndefined();
+    expect(parseChoice('<think>A or B?</think> B', ['A', 'B'])).toBe('B');
+  });
+
+  it('falls back to the default concurrency for a NaN or zero value', async () => {
+    for (const concurrency of [Number.NaN, 0, -3]) {
+      let peak = 0;
+      let inFlight = 0;
+      const asker = new ChatJevAsker({
+        baseUrl: 'http://localhost:11434',
+        model: 'kaineone/metzger:distill-0.8b',
+        concurrency,
+        fetch: async () => {
+          inFlight += 1;
+          peak = Math.max(peak, inFlight);
+          await new Promise((resolve) => setTimeout(resolve, 1));
+          inFlight -= 1;
+          return { status: 200, ok: true, text: JSON.stringify({ message: { content: 'A' } }) };
+        },
+      });
+      const questions = Object.fromEntries(
+        Array.from({ length: 6 }, (_, i) => [`q${i}`, { type: 'noul' as const, instructions: `Keep ${i}?` }]),
+      );
+      const { answers } = await asker.ask('s', questions);
+      expect(Object.values(answers).every((a) => 'noul' in a && typeof a.noul === 'number')).toBe(true);
+      expect(peak).toBe(2);
+    }
   });
 
   it('keeps the item when the reply names no option', async () => {

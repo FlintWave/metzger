@@ -456,10 +456,15 @@ describe('backend selection', () => {
     await createJevAsker({}, fetchFn).ask('s', q);
     await createJevAsker({ model: 'kaineone/metzger:distill-0.8b' }, fetchFn).ask('s', q);
     await createJevAsker({ model: 'kaineone/metzger:distill-0.8b', baseUrl: 'http://box:11434/v1/systemone/' }, fetchFn).ask('s', q);
+    // The Ollama root alone also finds the decision endpoint, as it did for the chat backend before.
+    await createJevAsker({ baseUrl: 'http://box:11434' }, fetchFn).ask('s', q);
+    await createJevAsker({ baseUrl: 'http://box:11434/' }, fetchFn).ask('s', q);
     expect(urls).toEqual([
       'http://localhost:11434/v1/systemone',
       'http://localhost:11434/api/chat',
       'http://box:11434/api/chat',
+      'http://box:11434/v1/systemone',
+      'http://box:11434/v1/systemone',
     ]);
   });
 

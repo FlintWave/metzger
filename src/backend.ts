@@ -32,6 +32,11 @@ export function ollamaBaseUrl(baseUrl: string): string {
   return baseUrl.replace(/\/v1\/systemone\/?$/, '').replace(/\/+$/, '');
 }
 
+/** The decision endpoint for either the Ollama root or the endpoint URL itself. */
+export function systemOneUrl(baseUrl: string): string {
+  return `${ollamaBaseUrl(baseUrl)}/v1/systemone`;
+}
+
 /** The local `/v1/systemone` endpoint rejects bodies (text + schema) over 64 KiB; stay under with margin. */
 export const SYSTEMONE_MAX_BODY_BYTES = 60 * 1024;
 /** Conservative token budgets for the systemone backend so a request fits in SYSTEMONE_MAX_BODY_BYTES. */
@@ -66,7 +71,7 @@ export function systemOneAsker(
 
 export type AskerConfig = {
   model?: string;
-  /** The systemone endpoint URL; the chat backend derives the Ollama root from it. */
+  /** The Ollama root (`http://localhost:11434`) or its decision endpoint (`.../v1/systemone`); either backend finds its URL from it. */
   baseUrl?: string;
   backend?: BackendOption;
   /** Chat backend only: how many questions are in flight at once. */
@@ -83,5 +88,5 @@ export function createJevAsker(config: AskerConfig, fetchFn: FetchLike): JevAske
       config.concurrency === undefined ? options : { ...options, concurrency: config.concurrency },
     );
   }
-  return systemOneAsker(fetchFn, 'local', model, baseUrl);
+  return systemOneAsker(fetchFn, 'local', model, systemOneUrl(baseUrl));
 }

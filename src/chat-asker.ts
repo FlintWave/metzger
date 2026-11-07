@@ -72,15 +72,19 @@ function hashString(s: string): number {
 /**
  * The option letter a chat reply names, or undefined. The model is told to
  * answer with the letter alone, but a trailing period, newline or a `Keep`
- * echo must not turn a keep into a drop, so the first standalone letter
- * (`B`, `B.`, `Answer: B`) counts, after any `<think>` block is skipped; a
- * letter inside a word (`Answer`, `Based`) does not.
+ * echo must not turn a keep into a drop, so the first standalone capital
+ * letter (`B`, `B.`, `Answer: B`) counts, after any `<think>` block (closed
+ * or cut off) is skipped. A letter inside a word (`Answer`) or a lowercase
+ * article (`a keep`) does not; a reply that is one lowercase letter does.
  */
 export function parseChoice(content: string, labels: readonly string[]): string | undefined {
-  const text = content.replace(/<think>[\s\S]*?<\/think>/g, '');
-  for (const match of text.matchAll(/(?<![A-Za-z0-9])([A-Za-z])(?![A-Za-z0-9])/g)) {
-    const letter = match[1]!.toUpperCase();
-    if (labels.includes(letter)) return letter;
+  const text = content.replace(/<think>[\s\S]*?(<\/think>|$)/g, '').trim();
+  if (/^[a-z]$/.test(text)) {
+    const letter = text.toUpperCase();
+    return labels.includes(letter) ? letter : undefined;
+  }
+  for (const match of text.matchAll(/(?<![A-Za-z0-9])([A-Z])(?![A-Za-z0-9])/g)) {
+    if (labels.includes(match[1]!)) return match[1];
   }
   return undefined;
 }
@@ -173,7 +177,11 @@ export class ChatJevAsker implements JevAsker {
 
   async ask(state: JevState, questions: JevQuestions): Promise<JevResponse> {
     const entries = Object.entries(questions);
-    const limit = this.opts.concurrency ?? DEFAULT_CHAT_CONCURRENCY;
+    const configured = this.opts.concurrency;
+    const limit =
+      typeof configured === 'number' && Number.isFinite(configured) && configured >= 1
+        ? Math.floor(configured)
+        : DEFAULT_CHAT_CONCURRENCY;
     const results = await mapLimit(entries, limit, ([name, question]) => {
       if (question.type !== 'noul') {
         return Promise.resolve<JevAnswer>({ type: 'noul', noul: 0.5 });
