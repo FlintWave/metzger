@@ -32,9 +32,14 @@ export function ollamaBaseUrl(baseUrl: string): string {
   return baseUrl.replace(/\/v1\/systemone\/?$/, '').replace(/\/+$/, '');
 }
 
-/** The decision endpoint for either the Ollama root or the endpoint URL itself. */
+/**
+ * The decision endpoint: a bare origin (`http://localhost:11434`) gets Ollama's
+ * `/v1/systemone` path; any URL that already has a path is used as given, so a
+ * reverse proxy at its own path keeps working.
+ */
 export function systemOneUrl(baseUrl: string): string {
-  return `${ollamaBaseUrl(baseUrl)}/v1/systemone`;
+  const trimmed = baseUrl.replace(/\/+$/, '');
+  return /^https?:\/\/[^/]+$/.test(trimmed) ? `${trimmed}/v1/systemone` : trimmed;
 }
 
 /** The local `/v1/systemone` endpoint rejects bodies (text + schema) over 64 KiB; stay under with margin. */

@@ -140,8 +140,10 @@ flight, so queued requests never pile up behind Ollama's own parallelism.
 
 Text typed after `/compact` (for example `/compact keep the migration plan`)
 becomes the goal the scorer keeps in mind, ahead of a configured `goal`. Claude Code's ahead-of-time
-"precompute" compactions are left to the built-in summarizer; Metzger decides
-at the real compaction, when the transcript is final.
+"precompute" compactions are skipped (nothing is computed or kept); Metzger
+decides at the real compaction, when the transcript is final. Once Metzger
+knows it cannot run (Ollama down, model not pulled), precomputes go to the
+built-in summarizer so the fallback summary is ready ahead of time.
 
 ## Options
 

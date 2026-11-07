@@ -75,12 +75,13 @@ function hashString(s: string): number {
  * echo must not turn a keep into a drop, so the first standalone capital
  * letter (`B`, `B.`, `Answer: B`) counts, after any `<think>` block (closed
  * or cut off) is skipped. A letter inside a word (`Answer`) or a lowercase
- * article (`a keep`) does not; a reply that is one lowercase letter does.
+ * article (`a keep`) does not; a reply that is one lowercase letter (`b.`) does.
  */
 export function parseChoice(content: string, labels: readonly string[]): string | undefined {
   const text = content.replace(/<think>[\s\S]*?(<\/think>|$)/g, '').trim();
-  if (/^[a-z]$/.test(text)) {
-    const letter = text.toUpperCase();
+  const lone = text.match(/^([a-z])[.)\]:]?$/);
+  if (lone) {
+    const letter = lone[1]!.toUpperCase();
     return labels.includes(letter) ? letter : undefined;
   }
   for (const match of text.matchAll(/(?<![A-Za-z0-9])([A-Z])(?![A-Za-z0-9])/g)) {

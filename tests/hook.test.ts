@@ -325,16 +325,27 @@ describe('turn.complete auto-compact', () => {
     expect(order).toEqual(['next', 'compact']);
   });
 
-  it('does not double-schedule across two turn.complete events', async () => {
+  it('compacts once for two turn.complete events: only the newest schedule runs', async () => {
     const { hooks, $, flush } = setup();
     await hooks.get('turn.complete')!($, {}, async () => 'r');
     await hooks.get('turn.complete')!($, {}, async () => 'r');
-    expect($.clock.after).toHaveBeenCalledTimes(1);
+    expect($.clock.after).toHaveBeenCalledTimes(2);
+    await flush();
+    expect($.session.usage).toHaveBeenCalledTimes(1);
+    expect($.session.compact).toHaveBeenCalledTimes(1);
+    // after it finishes a later turn schedules again
+    await hooks.get('turn.complete')!($, {}, async () => 'r');
+    await flush();
+    expect($.session.compact).toHaveBeenCalledTimes(2);
+  });
+
+  it('is not blocked by a timer the host refused or lost', async () => {
+    const { hooks, $, timers, flush } = setup();
+    await hooks.get('turn.complete')!($, {}, async () => 'r');
+    timers.length = 0; // the dispatch never fires
+    await hooks.get('turn.complete')!($, {}, async () => 'r');
     await flush();
     expect($.session.compact).toHaveBeenCalledTimes(1);
-    // after it finishes a later turn may schedule again
-    await hooks.get('turn.complete')!($, {}, async () => 'r');
-    expect($.clock.after).toHaveBeenCalledTimes(2);
   });
 
   it('retries quietly while the turn is still running, then succeeds', async () => {
@@ -481,7 +492,7 @@ describe('status command', () => {
       throw new Error('ECONNREFUSED');
     });
     const text = await runStatus(h);
-    expect(text).toContain('ollama: not reachable: ECONNREFUSED');
+    expect(text).toContain('ollama: not reachable: request to http://localhost:11434/api/version failed: ECONNREFUSED');
     expect(text).toContain('last compaction: none yet this session');
     expect(text).toContain('budgets: state 15000');
   });
@@ -613,6 +624,17 @@ describe('session.compact triggers', () => {
     expect(h.$.session.compact).toHaveBeenCalledTimes(2);
   });
 
+  it('does not take "busy" or "turn too long" for a running turn', async () => {
+    for (const text of ['model busy', 'turn too long for the summarizer']) {
+      const h = setup(90, async () => {
+        throw new Error(text);
+      });
+      await h.hooks.get('turn.complete')!(h.$, {}, async () => 'r');
+      await h.flush();
+      expect(h.$.session.compact).toHaveBeenCalledTimes(1);
+    }
+  });
+
   it('does not take "returned" for a running turn', async () => {
     const h = setup(90, async () => {
       throw new Error('summarizer returned an empty response');
@@ -623,46 +645,85 @@ describe('session.compact triggers', () => {
     expect(h.$.ui.log).toHaveBeenCalledWith('auto-compact skipped (summarizer returned an empty response)');
   });
 
-  it('never overlaps two auto-compactions when a stale schedule fires late', async () => {
+  it('never overlaps two auto-compactions when an old timer fires late', async () => {
     let release: (() => void) | undefined;
     const h = setup(90, async () => new Promise<void>((resolve) => { release = resolve; }));
-    const realNow = Date.now;
-    try {
-      let now = 1_000_000;
-      Date.now = () => now;
-      await h.hooks.get('turn.complete')!(h.$, {}, async () => 'r');
-      const late = h.timers.shift()!; // the host holds the first timer
-      now += 6 * 60_000;
-      await h.hooks.get('turn.complete')!(h.$, {}, async () => 'r'); // taken as stale: scheduled again
-      late.fn(); // the first fires late and starts compacting
-      for (let i = 0; i < 10; i++) await Promise.resolve();
-      expect(h.$.session.compact).toHaveBeenCalledTimes(1);
-      await h.flush(); // the second fires while the first is still compacting
-      expect(h.$.session.compact).toHaveBeenCalledTimes(1);
-      release!();
-      for (let i = 0; i < 10; i++) await Promise.resolve();
-    } finally {
-      Date.now = realNow;
-    }
+    await h.hooks.get('turn.complete')!(h.$, {}, async () => 'r');
+    const old = h.timers.shift()!; // the host holds the first timer
+    await h.hooks.get('turn.complete')!(h.$, {}, async () => 'r');
+    await h.flush(); // the newest schedule starts compacting
+    expect(h.$.session.compact).toHaveBeenCalledTimes(1);
+    old.fn(); // the old one fires late while the compaction runs
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(h.$.session.compact).toHaveBeenCalledTimes(1);
+    release!();
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    // a turn completing during the compaction schedules nothing, a later one does
+    await h.hooks.get('turn.complete')!(h.$, {}, async () => 'r');
+    await h.flush();
+    expect(h.$.session.compact).toHaveBeenCalledTimes(2);
   });
 
-  it('schedules again once a lost schedule has gone stale', async () => {
-    const h = setup(90);
-    const realNow = Date.now;
-    try {
-      let now = 1_000_000;
-      Date.now = () => now;
-      await h.hooks.get('turn.complete')!(h.$, {}, async () => 'r');
-      // The timer dispatch was refused: nothing ever fires, nothing resets the flag.
-      h.timers.length = 0;
-      await h.hooks.get('turn.complete')!(h.$, {}, async () => 'r');
-      expect(h.$.clock.after).toHaveBeenCalledTimes(1);
-      now += 6 * 60_000;
-      await h.hooks.get('turn.complete')!(h.$, {}, async () => 'r');
-      expect(h.$.clock.after).toHaveBeenCalledTimes(2);
-    } finally {
-      Date.now = realNow;
-    }
+  it('runs the Ollama check once when a compaction arrives while it is in flight', async () => {
+    let tags = 0;
+    const h = setup(90, undefined, { preserveRecentMessages: 1 }, async (url: string, init?: { body?: string }) => {
+      if (url.endsWith('/api/tags')) {
+        tags += 1;
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        return ok(JSON.stringify({ models: [{ name: 'kaineone/metzger:0.8b' }] }));
+      }
+      return jevFetch(() => 0.1)(url, init);
+    });
+    await h.hooks.get('session.start')!(h.$, {}, async () => 'r');
+    h.timers.shift()!.fn(); // the timer's check starts
+    const out = await h.hooks.get('session.compact')!(h.$, { trigger: 'manual', messages: transcript() }, async () => 'core');
+    expect(out).toHaveProperty('messages');
+    expect(tags).toBe(1);
+  });
+
+  it('hands a precompute to core once it knows Metzger cannot run', async () => {
+    const h = setup(90, undefined, { preserveRecentMessages: 1 }, async (url: string) => {
+      if (url.endsWith('/api/tags')) return ok(JSON.stringify({ models: [] }));
+      throw new Error('unexpected ' + url);
+    });
+    await h.hooks.get('session.start')!(h.$, {}, async () => 'r');
+    await h.flush();
+    expect(h.$.ui.toast.mock.calls[0]![0]).toContain('not found');
+    const next = vi.fn(async () => 'core');
+    const out = await h.hooks.get('session.compact')!(h.$, { trigger: 'precompute', messages: transcript() }, next);
+    expect(out).toBe('core');
+    expect(next).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('endpoint URLs', () => {
+  it('probes and compacts at the same endpoint for a root baseUrl, and leaves a custom path alone', async () => {
+    const urls: string[] = [];
+    const fetchImpl = async (url: string, init?: { method?: string; body?: string }) => {
+      urls.push(url);
+      if (url.endsWith('/api/version')) return ok('{"version":"0.9.1"}');
+      return (await ollama(['kaineone/metzger:0.8b'], ok('{"answers":{"q1":{"type":"noul","noul":0.5}}}'))(url, init));
+    };
+    const h = setup(90, undefined, { baseUrl: 'http://localhost:11434' }, fetchImpl);
+    await runStatus(h);
+    expect(urls.filter((u) => u === 'http://localhost:11434/v1/systemone')).toHaveLength(1);
+    expect(urls.some((u) => u === 'http://localhost:11434')).toBe(false);
+
+    const bodies: string[] = [];
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), baseUrl: 'http://localhost:11434' };
+    await compactSession(transcript(), config, async (url, init) => {
+      bodies.push(url);
+      return jevFetch(() => 0.1)(url, init);
+    });
+    expect(bodies).toEqual(['http://localhost:11434/v1/systemone']);
+
+    const custom = { ...config, baseUrl: 'https://gpu.local/metzger' };
+    const seen: string[] = [];
+    await compactSession(transcript(), custom, async (url, init) => {
+      seen.push(url);
+      return jevFetch(() => 0.1)(url, init);
+    });
+    expect(seen).toEqual(['https://gpu.local/metzger']);
   });
 });
 
@@ -697,6 +758,9 @@ describe('chat answer parsing', () => {
     expect(parseChoice('This is a keep, so B', ['A', 'B'])).toBe('B');
     expect(parseChoice('a', ['A', 'B'])).toBe('A');
     expect(parseChoice('b\n', ['A', 'B'])).toBe('B');
+    expect(parseChoice('b.', ['A', 'B'])).toBe('B');
+    expect(parseChoice('a)', ['A', 'B'])).toBe('A');
+    expect(parseChoice('a keep', ['A', 'B'])).toBeUndefined();
     expect(parseChoice('<think>A or B? A', ['A', 'B'])).toBeUndefined();
     expect(parseChoice('<think>A or B?</think> B', ['A', 'B'])).toBe('B');
   });

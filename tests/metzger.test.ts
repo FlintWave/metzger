@@ -459,12 +459,15 @@ describe('backend selection', () => {
     // The Ollama root alone also finds the decision endpoint, as it did for the chat backend before.
     await createJevAsker({ baseUrl: 'http://box:11434' }, fetchFn).ask('s', q);
     await createJevAsker({ baseUrl: 'http://box:11434/' }, fetchFn).ask('s', q);
+    // A URL with a path of its own (a reverse proxy) is used as given.
+    await createJevAsker({ baseUrl: 'https://gpu.local/metzger' }, fetchFn).ask('s', q);
     expect(urls).toEqual([
       'http://localhost:11434/v1/systemone',
       'http://localhost:11434/api/chat',
       'http://box:11434/api/chat',
       'http://box:11434/v1/systemone',
       'http://box:11434/v1/systemone',
+      'https://gpu.local/metzger',
     ]);
   });
 

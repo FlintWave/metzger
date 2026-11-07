@@ -16,6 +16,7 @@ import {
   resolveBackend,
   SYSTEMONE_MAX_REQUEST_TOKENS,
   SYSTEMONE_MAX_STATE_TOKENS,
+  systemOneUrl,
   type Backend,
   type BackendOption,
   type FetchInit,
@@ -264,14 +265,18 @@ function errorMessage(error: unknown): string {
 
 type HostNet = {
   clock: { after: Scheduler };
-  http: { fetch: (url: string, init?: HookFetchInit) => Promise<HookFetchResponse> };
+  http: { fetch: FetchLike };
 };
 
 type SetupState = {
   /** True once the Ollama check has settled the model name (or was skipped); until then a compaction runs it first. */
   resolved: boolean;
+  /** False once the check found Ollama down or the model missing: Metzger will fall back, so core may prepare. */
+  usable: boolean;
   /** The pulled model's context size, 0 when unknown. */
   numCtx: number;
+  /** The check in flight, so a compaction arriving meanwhile joins it instead of running a second one. */
+  pending?: Promise<void>;
 };
 
 type HostSetup = HostNet & {
@@ -284,12 +289,21 @@ type HostSetup = HostNet & {
  * Never throws. A top-level function, as the engine requires of anything `$`
  * is passed to.
  */
-async function resolveSetup($: HostSetup, config: HookConfig, state: SetupState): Promise<void> {
-  if (state.resolved) return;
+function resolveSetup($: HostSetup, config: HookConfig, state: SetupState): Promise<void> {
+  if (state.resolved) return Promise.resolve();
+  if (!state.pending) {
+    state.pending = checkSetup($, config, state).finally(() => {
+      state.pending = undefined;
+    });
+  }
+  return state.pending;
+}
+
+async function checkSetup($: HostSetup, config: HookConfig, state: SetupState): Promise<void> {
   const check = await checkOllamaModel(hookFetch($, NETWORK_TIMEOUT_MS), config.baseUrl, config.model);
-  if (state.resolved) return;
   state.resolved = true;
   state.numCtx = check.numCtx;
+  state.usable = check.ollamaUp && check.modelPulled;
 
   if (!check.ollamaUp) {
     $.ui.toast(
@@ -313,14 +327,16 @@ async function resolveSetup($: HostSetup, config: HookConfig, state: SetupState)
   }
 }
 
-/** `$.http.fetch` as a `HookFetch`, each request bounded by `ms` on the host clock. */
+/** `$.http.fetch` as a `HookFetch`: each request bounded by `ms` on the host clock, each failure naming its URL once. */
 function hookFetch($: HostNet, ms: number): HookFetch {
   return (url, init) =>
-    withTimeout((wait, fn) => $.clock.after(wait, fn), ms, `request to ${url}`, $.http.fetch(url, init)).then((r) => ({
-      status: r.status,
-      ok: r.ok,
-      text: r.text,
-    }));
+    withTimeout((wait, fn) => $.clock.after(wait, fn), ms, `request to ${url}`, $.http.fetch(url, init)).then(
+      (r) => ({ status: r.status, ok: r.ok, text: r.text }),
+      (error: unknown) => {
+        const message = errorMessage(error);
+        throw new Error(message.startsWith('request to ') ? message : `request to ${url} failed: ${message}`);
+      },
+    );
 }
 
 /** The pulled-model name that stands in for `model`, or undefined. Exact name or `:latest` only. */
@@ -460,7 +476,7 @@ export async function probeLine(
       }
       return `chat probe: HTTP ${response.status} in ${elapsed()}, model answered "${content.trim().slice(0, 40)}"`;
     }
-    const response = await fetchFn(config.baseUrl, {
+    const response = await fetchFn(systemOneUrl(config.baseUrl), {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: 'Bearer local' },
       body: JSON.stringify({
@@ -491,24 +507,29 @@ export async function probeLine(
 const COMPACT_DELAY_MS = 250;
 const COMPACT_RETRY_MS = 1000;
 const COMPACT_RETRIES = 3;
-/** A scheduled auto-compact older than this is taken as lost (its timer never fired) and may be scheduled again. */
-const SCHEDULE_STALE_MS = 5 * 60_000;
 
 /** The plugin's file command `commands/status.md`, namespaced by the host as `/metzger:status`. */
 const STATUS_COMMAND = 'metzger:status';
 
-/** `$.session.compact` rejects while a turn runs; the exact wording is the host's, so match the words, not a substring. */
+/**
+ * `$.session.compact` rejects while a turn runs; the exact wording is the
+ * host's. Only a message that says a turn is running (or the session is not
+ * idle) earns a retry; any other failure is logged once, since each retry
+ * would re-run the whole scoring pass.
+ */
 function isTurnRunningError(message: string): boolean {
-  return /\bturn\b|\bin flight\b|\bnot idle\b|\bbusy\b/i.test(message);
+  return /\bturn\b[^.]*\b(running|runs|in progress|in flight|active|still)\b|\bwhile a turn\b|\bnot idle\b/i.test(message);
 }
 
 export const register: Register = (on: On, options: PluginOptions) => {
   const configured = resolveHookConfig(options);
   let compacting = false;
-  let scheduledAt: number | undefined;
+  /** Counts turn.complete schedules; a timer runs only while it is still the newest, so a lost one blocks nothing. */
+  let generation = 0;
   let setupChecked = false;
   const setup: SetupState = {
     resolved: !/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/.test(configured.baseUrl),
+    usable: true,
     numCtx: 0,
   };
   let lastCompaction: { at: number; text: string } | undefined;
@@ -614,8 +635,12 @@ export const register: Register = (on: On, options: PluginOptions) => {
     // A precompute installs nothing and runs ahead of time; Metzger decides at
     // the real compaction, when the transcript is final. Skipping it costs
     // nothing, where passing it to core would pay for a summary that is thrown
-    // away whenever Metzger's own answer stands.
-    if (event.trigger === 'precompute') return { skip: 'metzger decides at compaction time' };
+    // away whenever Metzger's own answer stands. Once the check has found that
+    // Metzger cannot run (Ollama down, model missing) core gets it, so the
+    // fallback summary is ready ahead of time as it was before.
+    if (event.trigger === 'precompute') {
+      return setup.resolved && !setup.usable ? next(event) : { skip: 'metzger decides at compaction time' };
+    }
     try {
       // Through this hook's own `$`, so the wait is not charged to its budget.
       await resolveSetup($, configured, setup);
@@ -625,14 +650,11 @@ export const register: Register = (on: On, options: PluginOptions) => {
       if (event.instructions && event.instructions.trim().length > 0) {
         config.goal = event.instructions.trim();
       }
-      const fetchFn = hookFetch($, COMPACT_REQUEST_TIMEOUT_MS);
-      const { result, messages } = await compactSession(event.messages, config, async (url, init) => {
-        try {
-          return await fetchFn(url, init);
-        } catch (error) {
-          throw new Error(`request to ${url} failed: ${errorMessage(error)}`);
-        }
-      });
+      const { result, messages } = await compactSession(
+        event.messages,
+        config,
+        hookFetch($, COMPACT_REQUEST_TIMEOUT_MS),
+      );
       for (const line of decisionLogLines(result)) $.ui.log(line);
       if (reductionRatio(result) < config.minReductionRatio) {
         const text = `fallback to built-in summary (below ${percent(config.minReductionRatio)} minimum: ${summarize(result)})`;
@@ -656,22 +678,21 @@ export const register: Register = (on: On, options: PluginOptions) => {
     // Subagent turns reach every hook; only the main loop may trigger compaction.
     if (event.agentId) return next(event);
     const result = await next(event);
-    const now = Date.now();
-    const pending = scheduledAt !== undefined && now - scheduledAt < SCHEDULE_STALE_MS;
-    if (compacting || pending) return result;
-    scheduledAt = now;
+    if (compacting) return result;
+    const mine = ++generation;
 
     // $.session.compact rejects while a turn runs, so start it after this hook
     // returns, and retry a few times if the host has not yet finished the turn.
-    const mine = now;
+    // Every turn schedules; only the newest schedule runs, so a timer the host
+    // refused or lost costs nothing beyond that one turn.
     const run = async (attempt: number): Promise<void> => {
+      if (mine !== generation || compacting) return;
       let retry = false;
       let owns = false;
       try {
-        // A schedule taken as lost may still fire late; never overlap a compaction.
-        if (compacting) return;
         const { context } = await $.session.usage();
-        if (compacting || (context.percent ?? 0) < configured.compactAtPercent) return;
+        if (mine !== generation || compacting) return;
+        if ((context.percent ?? 0) < configured.compactAtPercent) return;
         compacting = true;
         owns = true;
         const outcome = await $.session.compact();
@@ -689,8 +710,6 @@ export const register: Register = (on: On, options: PluginOptions) => {
         }
       } finally {
         if (owns) compacting = false;
-        // Only this run's own schedule is released; a newer one stays pending.
-        if (!retry && scheduledAt === mine) scheduledAt = undefined;
       }
       if (retry) {
         $.clock.after(COMPACT_RETRY_MS, () => {
