@@ -352,14 +352,23 @@ describe('compact', () => {
       goal: '',
       preserveRecentMessages: 1,
     }).tokens;
-    const output = await compact(
-      messages,
-      fakeJev((name) => (name.startsWith('call_') ? 0.9 : 0.1), seen),
-      { preserveRecentMessages: 1, maxRequestTokens: stateTokens + 150 },
-    );
+    let inFlight = 0;
+    let inFlightPeak = 0;
+    const base = fakeJev((name) => (name.startsWith('call_') ? 0.9 : 0.1), seen);
+    const serial: JevAsker = {
+      async ask(state, questions) {
+        inFlight += 1;
+        inFlightPeak = Math.max(inFlightPeak, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        inFlight -= 1;
+        return base.ask(state, questions);
+      },
+    };
+    const output = await compact(messages, serial, { preserveRecentMessages: 1, maxRequestTokens: stateTokens + 150 });
 
     expect(output.stats.requests).toBe(seen.length);
     expect(seen.length).toBeGreaterThan(1);
+    expect(inFlightPeak).toBe(1);
     expect(seen.flatMap((r) => r.questions).sort()).toEqual([
       'call_t1',
       'call_t2',

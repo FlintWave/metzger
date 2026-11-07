@@ -133,12 +133,13 @@ to its first 300 characters plus a note. Below it for both: the whole thing is
 removed.
 
 If the conversation is long, the scoring is split across multiple requests
-(same full context, different batches of questions) that run concurrently.
+(same full context, different batches of questions, at most 64 questions
+each) sent one after another, since Ollama serves them one at a time anyway.
 The chat-API backend asks one question per request and keeps only a couple in
 flight, so queued requests never pile up behind Ollama's own parallelism.
 
 Text typed after `/compact` (for example `/compact keep the migration plan`)
-becomes the goal the scorer keeps in mind. Claude Code's ahead-of-time
+becomes the goal the scorer keeps in mind, ahead of a configured `goal`. Claude Code's ahead-of-time
 "precompute" compactions are left to the built-in summarizer; Metzger decides
 at the real compaction, when the transcript is final.
 

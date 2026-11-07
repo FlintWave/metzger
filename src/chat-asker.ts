@@ -1,3 +1,4 @@
+import type { FetchLike } from './backend.js';
 import type { JevAnswer, JevAsker, JevQuestions, JevResponse, JevState, NoulQuestion } from './types.js';
 
 const SYSTEM_PROMPT =
@@ -14,8 +15,7 @@ export interface ChatAskerOptions {
   /** Ollama base URL, e.g. `http://localhost:11434`. No trailing path. */
   baseUrl: string;
   model: string;
-  fetch: (url: string, init?: { method?: string; headers?: Record<string, string>; body?: string }) =>
-    Promise<{ status: number; ok: boolean; text: string }>;
+  fetch: FetchLike;
   /** How many chat requests to keep in flight at once. Default 2. */
   concurrency?: number;
 }
@@ -72,15 +72,17 @@ function hashString(s: string): number {
 /**
  * The option letter a chat reply names, or undefined. The model is told to
  * answer with the letter alone, but a trailing period, newline or a `Keep`
- * echo must not turn a keep into a drop, so the reply's first option letter
- * counts, after any `<think>` block is skipped.
+ * echo must not turn a keep into a drop, so the first standalone letter
+ * (`B`, `B.`, `Answer: B`) counts, after any `<think>` block is skipped; a
+ * letter inside a word (`Answer`, `Based`) does not.
  */
 export function parseChoice(content: string, labels: readonly string[]): string | undefined {
-  const text = content.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-  const match = text.match(/[A-Za-z]/);
-  if (!match) return undefined;
-  const letter = match[0].toUpperCase();
-  return labels.includes(letter) ? letter : undefined;
+  const text = content.replace(/<think>[\s\S]*?<\/think>/g, '');
+  for (const match of text.matchAll(/(?<![A-Za-z0-9])([A-Za-z])(?![A-Za-z0-9])/g)) {
+    const letter = match[1]!.toUpperCase();
+    if (labels.includes(letter)) return letter;
+  }
+  return undefined;
 }
 
 async function askOne(
@@ -127,7 +129,11 @@ async function askOne(
   return { type: 'noul', noul: choice === trueLabel ? 1.0 : 0.0 };
 }
 
-/** Runs `tasks` with at most `limit` in flight, resolving their results in order. */
+/**
+ * Runs `task` over `items` with at most `limit` in flight, resolving the
+ * results in order. Once one task rejects no further task is started, so a
+ * failed batch does not go on loading the model with requests nobody reads.
+ */
 async function mapLimit<T, R>(
   items: readonly T[],
   limit: number,
@@ -135,10 +141,16 @@ async function mapLimit<T, R>(
 ): Promise<R[]> {
   const results: R[] = new Array(items.length);
   let nextIndex = 0;
+  let failed = false;
   const worker = async (): Promise<void> => {
-    while (nextIndex < items.length) {
+    while (!failed && nextIndex < items.length) {
       const index = nextIndex++;
-      results[index] = await task(items[index]!);
+      try {
+        results[index] = await task(items[index]!);
+      } catch (error) {
+        failed = true;
+        throw error;
+      }
     }
   };
   const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, worker);

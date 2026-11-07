@@ -14,12 +14,13 @@ import {
   DEFAULT_SYSTEMONE_URL,
   ollamaBaseUrl,
   resolveBackend,
-  SYSTEMONE_MAX_BODY_BYTES,
   SYSTEMONE_MAX_REQUEST_TOKENS,
   SYSTEMONE_MAX_STATE_TOKENS,
-  systemOneAsker,
   type Backend,
   type BackendOption,
+  type FetchInit,
+  type FetchLike,
+  type FetchResponse,
 } from '../src/backend.js';
 import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
 import type {
@@ -37,20 +38,10 @@ const HOOK_DEFAULTS = {
   model: DEFAULT_MODEL,
 };
 
-export type HookFetchInit = {
-  method?: string;
-  headers?: Record<string, string>;
-  body?: string;
-};
-
-export type HookFetchResponse = {
-  status: number;
-  ok: boolean;
-  text: string;
-};
-
+export type HookFetchInit = FetchInit;
+export type HookFetchResponse = FetchResponse;
 /** The shape of `$.http.fetch`, so the hook can be driven without an engine. */
-export type HookFetch = (url: string, init?: HookFetchInit) => Promise<HookFetchResponse>;
+export type HookFetch = FetchLike;
 
 export type HookConfig = CompactOptions & {
   baseUrl: string;
@@ -101,11 +92,6 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   if (goal) config.goal = goal;
   return config;
 }
-
-export { SYSTEMONE_MAX_BODY_BYTES, SYSTEMONE_MAX_REQUEST_TOKENS, SYSTEMONE_MAX_STATE_TOKENS };
-
-/** A `JevAsker` over the engine's `$.http.fetch`, speaking the decision protocol. */
-export const jevAsker = systemOneAsker;
 
 function toolUseSummary(tool: ToolUse): ToolUseSummary {
   const summary: ToolUseSummary = {
@@ -450,9 +436,9 @@ const SCHEDULE_STALE_MS = 5 * 60_000;
 /** The plugin's file command `commands/status.md`, namespaced by the host as `/metzger:status`. */
 const STATUS_COMMAND = 'metzger:status';
 
-/** `$.session.compact` rejects while a turn runs; the exact wording is the host's, so match loosely. */
+/** `$.session.compact` rejects while a turn runs; the exact wording is the host's, so match the words, not a substring. */
 function isTurnRunningError(message: string): boolean {
-  return /turn|in flight|busy|not idle/i.test(message);
+  return /\bturn\b|\bin flight\b|\bnot idle\b|\bbusy\b/i.test(message);
 }
 
 export const register: Register = (on: On, options: PluginOptions) => {
@@ -460,6 +446,8 @@ export const register: Register = (on: On, options: PluginOptions) => {
   let compacting = false;
   let scheduledAt: number | undefined;
   let setupChecked = false;
+  /** Settles once the Ollama check has run (or was skipped); a compaction waits for it so the model name is final. */
+  let setupDone: Promise<void> = Promise.resolve();
   let modelNumCtx = 0;
   let lastCompaction: { at: number; text: string } | undefined;
   const record = (text: string): void => {
@@ -511,8 +499,10 @@ export const register: Register = (on: On, options: PluginOptions) => {
         configured.model = check.model;
       }
     };
-    $.clock.after(0, () => {
-      void checkSetup();
+    setupDone = new Promise<void>((resolve) => {
+      $.clock.after(0, () => {
+        checkSetup().then(resolve, resolve);
+      });
     });
 
     return result;
@@ -609,9 +599,11 @@ export const register: Register = (on: On, options: PluginOptions) => {
     // the summary the fallback path would use.
     if (event.trigger === 'precompute') return next(event);
     try {
+      await setupDone;
       const config = effectiveConfig(configured, modelNumCtx);
-      // What the person typed after /compact is what to keep in mind while scoring.
-      if (!config.goal && event.instructions && event.instructions.trim().length > 0) {
+      // What the person typed after /compact is the most specific statement of
+      // intent there is, so it wins over a configured `goal`.
+      if (event.instructions && event.instructions.trim().length > 0) {
         config.goal = event.instructions.trim();
       }
       const { result, messages } = await compactSession(event.messages, config, async (url, init) => {
@@ -658,12 +650,17 @@ export const register: Register = (on: On, options: PluginOptions) => {
 
     // $.session.compact rejects while a turn runs, so start it after this hook
     // returns, and retry a few times if the host has not yet finished the turn.
+    const mine = now;
     const run = async (attempt: number): Promise<void> => {
       let retry = false;
+      let owns = false;
       try {
+        // A schedule taken as lost may still fire late; never overlap a compaction.
+        if (compacting) return;
         const { context } = await $.session.usage();
-        if ((context.percent ?? 0) < configured.compactAtPercent) return;
+        if (compacting || (context.percent ?? 0) < configured.compactAtPercent) return;
         compacting = true;
+        owns = true;
         const outcome = await $.session.compact();
         if (outcome && 'skip' in outcome && outcome.skip) {
           record(`auto-compact skipped by a hook (${outcome.skip})`);
@@ -678,8 +675,9 @@ export const register: Register = (on: On, options: PluginOptions) => {
           $.ui.log(`auto-compact skipped (${message})`);
         }
       } finally {
-        compacting = false;
-        if (!retry) scheduledAt = undefined;
+        if (owns) compacting = false;
+        // Only this run's own schedule is released; a newer one stays pending.
+        if (!retry && scheduledAt === mine) scheduledAt = undefined;
       }
       if (retry) {
         $.clock.after(COMPACT_RETRY_MS, () => {

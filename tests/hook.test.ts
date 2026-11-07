@@ -3,16 +3,18 @@ import {
   compactSession,
   decisionLog,
   decisionLogLines,
-  jevAsker,
   register,
-  SYSTEMONE_MAX_BODY_BYTES,
-  SYSTEMONE_MAX_REQUEST_TOKENS,
-  SYSTEMONE_MAX_STATE_TOKENS,
   resolveHookConfig,
   summarize,
   toSessionMessages,
 } from '../hooks/metzger.ts';
-import { ChatJevAsker } from '../src/chat-asker.js';
+import {
+  SYSTEMONE_MAX_BODY_BYTES,
+  SYSTEMONE_MAX_REQUEST_TOKENS,
+  SYSTEMONE_MAX_STATE_TOKENS,
+  systemOneAsker,
+} from '../src/backend.js';
+import { ChatJevAsker, parseChoice } from '../src/chat-asker.js';
 import { applyDecisions, collectToolCalls, decideCall, type Message } from '../src/index.js';
 
 type SessionMessage = Message & { handle?: string };
@@ -391,7 +393,7 @@ describe('session.compact', () => {
 describe('systemone request size cap', () => {
   it('throws a clear error instead of sending an oversized body', async () => {
     const fetchFn = vi.fn(async () => ({ status: 200, ok: true, text: '{}' }));
-    const asker = jevAsker(fetchFn, 'local', 'kaineone/metzger:0.8b');
+    const asker = systemOneAsker(fetchFn, 'local', 'kaineone/metzger:0.8b');
     const huge = 'x'.repeat(SYSTEMONE_MAX_BODY_BYTES + 10);
     await expect(
       asker.ask(huge, { q: { type: 'noul', instructions: 'Keep?' } }),
@@ -553,9 +555,9 @@ describe('session.compact triggers', () => {
     expect(status).toContain('last compaction: none yet this session');
   });
 
-  it('uses the text typed after /compact as the scoring goal', async () => {
+  it('uses the text typed after /compact as the scoring goal, ahead of a configured goal', async () => {
     const bodies: string[] = [];
-    const h = setup(90, undefined, { preserveRecentMessages: 1 }, jevFetch(() => 0.1, bodies));
+    const h = setup(90, undefined, { preserveRecentMessages: 1, goal: 'ship the parser fix' }, jevFetch(() => 0.1, bodies));
     const out = await h.hooks.get('session.compact')!(
       h.$,
       { trigger: 'manual', instructions: 'keep the migration plan', messages: transcript() },
@@ -564,6 +566,27 @@ describe('session.compact triggers', () => {
     expect(out).toHaveProperty('messages');
     expect(bodies).toHaveLength(1);
     expect(JSON.parse(bodies[0]!).state.goal).toBe('keep the migration plan');
+    const without = await h.hooks.get('session.compact')!(h.$, { trigger: 'auto', messages: transcript() }, async () => 'core');
+    expect(without).toHaveProperty('messages');
+    expect(JSON.parse(bodies[1]!).state.goal).toBe('ship the parser fix');
+  });
+
+  it('waits for the deferred Ollama check so a compaction fired at once uses the resolved model name', async () => {
+    const bodies: string[] = [];
+    const fetchImpl = async (url: string, init?: { method?: string; body?: string }) => {
+      if (url.endsWith('/api/tags')) return ok(JSON.stringify({ models: [{ name: 'kaineone/metzger:0.8b' }] }));
+      if (url.endsWith('/api/show')) return ok(JSON.stringify({ capabilities: ['decision'], parameters: 'num_ctx 32768' }));
+      return jevFetch(() => 0.1, bodies)(url, init);
+    };
+    const h = setup(90, undefined, { model: 'metzger:0.8b', preserveRecentMessages: 1 }, fetchImpl);
+    await h.hooks.get('session.start')!(h.$, {}, async () => 'r');
+    // session.compact arrives before the timer-driven check has run: the hook must wait for it.
+    const pending = h.hooks.get('session.compact')!(h.$, { trigger: 'manual', messages: transcript() }, async () => 'core');
+    await h.flush();
+    const out = await pending;
+    expect(out).toHaveProperty('messages');
+    expect(bodies).toHaveLength(1);
+    expect(JSON.parse(bodies[0]!).model).toBe('kaineone/metzger:0.8b');
   });
 
   it('records a vetoed auto-compaction', async () => {
@@ -581,6 +604,39 @@ describe('session.compact triggers', () => {
     await h.hooks.get('turn.complete')!(h.$, {}, async () => 'r');
     await h.flush();
     expect(h.$.session.compact).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not take "returned" for a running turn', async () => {
+    const h = setup(90, async () => {
+      throw new Error('summarizer returned an empty response');
+    });
+    await h.hooks.get('turn.complete')!(h.$, {}, async () => 'r');
+    await h.flush();
+    expect(h.$.session.compact).toHaveBeenCalledTimes(1);
+    expect(h.$.ui.log).toHaveBeenCalledWith('auto-compact skipped (summarizer returned an empty response)');
+  });
+
+  it('never overlaps two auto-compactions when a stale schedule fires late', async () => {
+    let release: (() => void) | undefined;
+    const h = setup(90, async () => new Promise<void>((resolve) => { release = resolve; }));
+    const realNow = Date.now;
+    try {
+      let now = 1_000_000;
+      Date.now = () => now;
+      await h.hooks.get('turn.complete')!(h.$, {}, async () => 'r');
+      const late = h.timers.shift()!; // the host holds the first timer
+      now += 6 * 60_000;
+      await h.hooks.get('turn.complete')!(h.$, {}, async () => 'r'); // taken as stale: scheduled again
+      late.fn(); // the first fires late and starts compacting
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+      expect(h.$.session.compact).toHaveBeenCalledTimes(1);
+      await h.flush(); // the second fires while the first is still compacting
+      expect(h.$.session.compact).toHaveBeenCalledTimes(1);
+      release!();
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    } finally {
+      Date.now = realNow;
+    }
   });
 
   it('schedules again once a lost schedule has gone stale', async () => {
@@ -619,10 +675,19 @@ describe('chat answer parsing', () => {
     });
   const q = { q: { type: 'noul' as const, instructions: 'Keep?' } };
 
-  it('reads the letter through punctuation, whitespace and a think block', async () => {
+  it('reads the letter through punctuation, whitespace, a label and a think block', async () => {
     expect((await chatAsker((t) => `${t}.\n`).ask('s', q)).answers.q).toEqual({ type: 'noul', noul: 1 });
     expect((await chatAsker((_t, f) => ` ${f}`).ask('s', q)).answers.q).toEqual({ type: 'noul', noul: 0 });
     expect((await chatAsker((_t, f) => `<think>B or A?</think>\n${f}`).ask('s', q)).answers.q).toEqual({ type: 'noul', noul: 0 });
+    expect((await chatAsker((_t, f) => `Answer: ${f}`).ask('s', q)).answers.q).toEqual({ type: 'noul', noul: 0 });
+    expect((await chatAsker((t) => `Based on the state, ${t}`).ask('s', q)).answers.q).toEqual({ type: 'noul', noul: 1 });
+  });
+
+  it('never reads a letter inside a word', () => {
+    expect(parseChoice('Answer:', ['A', 'B'])).toBeUndefined();
+    expect(parseChoice('Based on the above', ['A', 'B'])).toBeUndefined();
+    expect(parseChoice('Answer: B', ['A', 'B'])).toBe('B');
+    expect(parseChoice('(a)', ['A', 'B'])).toBe('A');
   });
 
   it('keeps the item when the reply names no option', async () => {
@@ -637,6 +702,25 @@ describe('chat answer parsing', () => {
       fetch: async () => ({ status: 200, ok: true, text: '{"message":{}}' }),
     });
     await expect(asker.ask('s', q)).rejects.toThrow(/no message content/);
+  });
+
+  it('starts no further chat requests once one has failed', async () => {
+    let sent = 0;
+    const asker = new ChatJevAsker({
+      baseUrl: 'http://localhost:11434',
+      model: 'kaineone/metzger:distill-0.8b',
+      concurrency: 1,
+      fetch: async () => {
+        sent += 1;
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        return sent === 2 ? { status: 500, ok: false, text: 'boom' } : { status: 200, ok: true, text: JSON.stringify({ message: { content: 'A' } }) };
+      },
+    });
+    const questions = Object.fromEntries(
+      Array.from({ length: 10 }, (_, i) => [`q${i}`, { type: 'noul' as const, instructions: `Keep ${i}?` }]),
+    );
+    await expect(asker.ask('s', questions)).rejects.toThrow(/500/);
+    expect(sent).toBe(2);
   });
 
   it('keeps at most `concurrency` chat requests in flight', async () => {
